@@ -1,50 +1,81 @@
 import * as fs from 'fs'
 import {Octokit} from '@octokit/core'
-import {Endpoints} from '@octokit/types'
+import {
+  Endpoints,
+  ReposGetReleaseByTagResponseData,
+  ReposListReleasesResponseData,
+  ReposCreateReleaseResponseData
+} from '@octokit/types'
 import * as core from '@actions/core'
 import * as github from '@actions/github'
 import * as path from 'path'
 import * as glob from 'glob'
 
 type RepoAssetsResp = Endpoints['GET /repos/:owner/:repo/releases/:release_id/assets']['response']
-type ReleaseByTagResp = Endpoints['GET /repos/:owner/:repo/releases/tags/:tag']['response']
-type CreateReleaseResp = Endpoints['POST /repos/:owner/:repo/releases']['response']
 type UploadAssetResp = Endpoints['POST /repos/:owner/:repo/releases/:release_id/assets{?name,label}']['response']
-
+type ReleaseData =
+  | ReposGetReleaseByTagResponseData
+  | ReposListReleasesResponseData[0]
+  | ReposCreateReleaseResponseData
 async function get_release_by_tag(
   tag: string,
   prerelease: boolean,
   release_name: string,
   body: string,
   octokit: Octokit
-): Promise<ReleaseByTagResp | CreateReleaseResp> {
+): Promise<ReleaseData> {
   try {
-    core.debug(`Getting release by tag ${tag}.`)
-    return await octokit.repos.getReleaseByTag({
+    core.debug(`Getting release by tag ${tag}`)
+    const resp = await octokit.repos.getReleaseByTag({
       ...repo(),
       tag: tag
     })
+    return resp.data
   } catch (error) {
-    // If this returns 404, we need to create the release first.
-    if (error.status === 404) {
-      core.debug(
-        `Release for tag ${tag} doesn't exist yet so we'll create it now.`
-      )
-      return await octokit.repos.createRelease({
-        ...repo(),
-        tag_name: tag,
-        prerelease: prerelease,
-        name: release_name,
-        body: body
-      })
-    } else {
+    if (error.status !== 404) {
+      core.debug(`Failed to get release by tag. Not a 404 error. Throwing.`)
       throw error
     }
   }
+
+  // If we get 404, we need to check the release drafts.
+
+  try {
+    core.debug('Checking to see if a release draft with the tag exists.')
+    const resp = await octokit.repos.listReleases(repo())
+    let found = false
+    let draftRelease = resp.data[0]
+    for (const release of resp.data) {
+      if (release.tag_name === tag) {
+        draftRelease = release
+        found = true
+        break
+      }
+    }
+    if (found) {
+      core.debug('Found release draft with the given tag.')
+      return draftRelease
+    }
+  } catch (error) {
+    core.debug(`Failed to list the releases. Throwing.`)
+    throw error
+  }
+
+  // If we failed to find a release draft, we need to create the release first.
+
+  core.debug(`Release for tag ${tag} doesn't exist yet so we'll create it now.`)
+  const resp = octokit.repos.createRelease({
+    ...repo(),
+    tag_name: tag,
+    prerelease: prerelease,
+    name: release_name,
+    body: body
+  })
+  return resp.data
 }
 
 async function upload_to_release(
-  release: ReleaseByTagResp | CreateReleaseResp,
+  releaseData: ReleaseData,
   file: string,
   asset_name: string,
   tag: string,
@@ -53,7 +84,7 @@ async function upload_to_release(
 ): Promise<undefined | string> {
   const stat = fs.statSync(file)
   if (!stat.isFile()) {
-    core.debug(`Skipping ${file}, since its not a file`)
+    console.log(`Skipping ${file}, since its not a file`)
     return
   }
   const file_size = stat.size
@@ -62,12 +93,12 @@ async function upload_to_release(
   // Check for duplicates.
   const assets: RepoAssetsResp = await octokit.repos.listReleaseAssets({
     ...repo(),
-    release_id: release.data.id
+    release_id: releaseData.id
   })
   const duplicate_asset = assets.data.find(a => a.name === asset_name)
   if (duplicate_asset !== undefined) {
     if (overwrite) {
-      core.debug(
+      console.log(
         `An asset called ${asset_name} already exists in release ${tag} so we'll overwrite it.`
       )
       await octokit.repos.deleteReleaseAsset({
@@ -79,15 +110,15 @@ async function upload_to_release(
       return duplicate_asset.browser_download_url
     }
   } else {
-    core.debug(
+    console.log(
       `No pre-existing asset called ${asset_name} found in release ${tag}. All good.`
     )
   }
 
-  core.debug(`Uploading ${file} to ${asset_name} in release ${tag}.`)
+  console.log(`Uploading ${file} to ${asset_name} in release ${tag}.`)
   const uploaded_asset: UploadAssetResp = await octokit.repos.uploadReleaseAsset(
     {
-      url: release.data.upload_url,
+      url: releaseData.upload_url,
       name: asset_name,
       data: file_bytes,
       headers: {
